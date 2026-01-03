@@ -248,6 +248,226 @@ impl Vault {
 
         Ok(tables)
     }
+
+    /// Dump raw item data for debugging
+    pub fn dump_raw_item(&self, title: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM item WHERE lower(title) LIKE lower(?) AND trashed = 0 LIMIT 1",
+        )?;
+        let pattern = format!("%{}%", title);
+
+        let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let mut rows = stmt.query([&pattern])?;
+
+        let mut result = Vec::new();
+        if let Some(row) = rows.next()? {
+            for (i, name) in column_names.iter().enumerate() {
+                use rusqlite::types::ValueRef;
+                let value = match row.get_ref(i)? {
+                    ValueRef::Null => "NULL".to_string(),
+                    ValueRef::Integer(n) => n.to_string(),
+                    ValueRef::Real(f) => f.to_string(),
+                    ValueRef::Text(t) => format!("\"{}\"", String::from_utf8_lossy(t)),
+                    ValueRef::Blob(b) => format!("<blob {} bytes>", b.len()),
+                };
+                result.push((name.clone(), value));
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Dump raw itemfield data for debugging
+    pub fn dump_raw_fields(&self, item_uuid: &str) -> Result<Vec<Vec<(String, String)>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM itemfield WHERE item_uuid = ?",
+        )?;
+
+        let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let mut rows = stmt.query([item_uuid])?;
+
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mut field_data = Vec::new();
+            for (i, name) in column_names.iter().enumerate() {
+                use rusqlite::types::ValueRef;
+                let value = match row.get_ref(i)? {
+                    ValueRef::Null => "NULL".to_string(),
+                    ValueRef::Integer(n) => n.to_string(),
+                    ValueRef::Real(f) => f.to_string(),
+                    ValueRef::Text(t) => {
+                        let s = String::from_utf8_lossy(t);
+                        if s.len() > 50 {
+                            format!("\"{}...\"", &s[..50])
+                        } else {
+                            format!("\"{}\"", s)
+                        }
+                    },
+                    ValueRef::Blob(b) => format!("<blob {} bytes>", b.len()),
+                };
+                field_data.push((name.clone(), value));
+            }
+            result.push(field_data);
+        }
+
+        Ok(result)
+    }
+
+    // Write operations
+
+    /// Update a field's value for an existing item
+    pub fn update_field(&self, item_uuid: &str, field_type: &str, new_value: &str) -> Result<()> {
+        // Get the item to get its encryption key
+        let item = self.find_item_by_uuid(item_uuid)?
+            .ok_or_else(|| VaultError::DecryptionError("Item not found".into()))?;
+
+        let key = item.key.as_ref()
+            .ok_or_else(|| VaultError::DecryptionError("Item has no encryption key".into()))?;
+
+        // Encrypt the new value
+        let encrypted = encrypt_field(new_value, key, item_uuid)?;
+
+        // Update the field
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        self.conn.execute(
+            "UPDATE itemfield SET value = ?, updated_at = ?, value_updated_at = ?
+             WHERE item_uuid = ? AND type = ? AND deleted = 0",
+            rusqlite::params![encrypted, now, now, item_uuid, field_type],
+        )?;
+
+        // Update item timestamps
+        self.conn.execute(
+            "UPDATE item SET field_updated_at = ?, updated_at = ? WHERE uuid = ?",
+            rusqlite::params![now, now, item_uuid],
+        )?;
+
+        Ok(())
+    }
+
+    /// Create a new item with fields
+    pub fn create_item(&self, title: &str, category: &str, fields: &[(&str, &str, bool)]) -> Result<String> {
+        use rand::RngCore;
+
+        let item_uuid = uuid::Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Generate random 44-byte key (32 AES + 12 nonce)
+        let mut key = vec![0u8; 44];
+        rand::thread_rng().fill_bytes(&mut key);
+
+        // Template based on category
+        let template = format!("{}.default", category);
+
+        // Insert item with all required fields
+        self.conn.execute(
+            "INSERT INTO item (uuid, created_at, meta_updated_at, field_updated_at, title, subtitle, note, icon, category, template, key, updated_at, last_used)
+             VALUES (?, ?, ?, ?, ?, '', '', '', ?, ?, ?, ?, 0)",
+            rusqlite::params![item_uuid, now, now, now, title, category, template, key, now],
+        )?;
+
+        // Field UIDs should start at 10 like Enpass does
+        let base_uid = 10i64;
+
+        // Insert fields with all required columns
+        for (idx, (field_type, value, sensitive)) in fields.iter().enumerate() {
+            let field_value = if *sensitive {
+                encrypt_field(value, &key, &item_uuid)?
+            } else {
+                value.to_string()
+            };
+
+            // Compute hash like Enpass does (SHA1 of value)
+            let hash = if !value.is_empty() {
+                use sha1::{Sha1, Digest};
+                let mut hasher = Sha1::new();
+                hasher.update(value.as_bytes());
+                hex::encode(hasher.finalize())
+            } else {
+                String::new()
+            };
+
+            // Initial is first 2 chars for sensitive fields
+            let initial = if *sensitive && !value.is_empty() {
+                value.chars().take(2).collect::<String>()
+            } else {
+                String::new()
+            };
+
+            self.conn.execute(
+                "INSERT INTO itemfield (item_uuid, item_field_uid, label, value, type, sensitive, deleted, historical, form_id, updated_at, value_updated_at, orde, wearable, history, initial, hash, strength, algo_version, expiry, excluded, pwned_check_time, extra)
+                 VALUES (?, ?, '', ?, ?, ?, 0, 1, '', ?, ?, ?, 0, '', ?, ?, -1, 1, 0, 0, 0, '')",
+                rusqlite::params![
+                    item_uuid,
+                    base_uid + idx as i64,
+                    field_value,
+                    field_type,
+                    if *sensitive { 1 } else { 0 },
+                    now,
+                    now,
+                    idx as i64 + 1,  // orde starts at 1
+                    initial,
+                    hash,
+                ],
+            )?;
+        }
+
+        Ok(item_uuid)
+    }
+
+    /// Soft-delete an item
+    pub fn delete_item(&self, item_uuid: &str) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        self.conn.execute(
+            "UPDATE item SET deleted = 1, trashed = 1, updated_at = ? WHERE uuid = ?",
+            rusqlite::params![now, item_uuid],
+        )?;
+
+        Ok(())
+    }
+
+    /// Find item by exact UUID
+    pub fn find_item_by_uuid(&self, uuid: &str) -> Result<Option<Item>> {
+        use rusqlite::types::ValueRef;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT uuid, title, subtitle, category, trashed, favorite, key
+             FROM item WHERE uuid = ?",
+        )?;
+
+        let mut rows = stmt.query([uuid])?;
+
+        if let Some(row) = rows.next()? {
+            let key: Option<Vec<u8>> = match row.get_ref(6)? {
+                ValueRef::Null => None,
+                ValueRef::Text(t) => Some(t.to_vec()),
+                ValueRef::Blob(b) => Some(b.to_vec()),
+                _ => None,
+            };
+
+            Ok(Some(Item {
+                uuid: row.get(0)?,
+                title: row.get(1)?,
+                subtitle: row.get(2)?,
+                category: row.get(3)?,
+                trashed: row.get(4)?,
+                favorite: row.get(5)?,
+                key,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -335,6 +555,43 @@ impl ItemField {
             &self.label
         }
     }
+}
+
+/// Encrypt a field value using AES-GCM
+fn encrypt_field(plaintext: &str, item_key: &[u8], uuid: &str) -> Result<String> {
+    use aes_gcm::aead::Aead;
+
+    if item_key.len() < 44 {
+        return Err(VaultError::DecryptionError(format!(
+            "Invalid item key length: {}",
+            item_key.len()
+        )));
+    }
+
+    let aes_key = &item_key[0..32];
+    let nonce_bytes = &item_key[32..44];
+
+    let cipher = Aes256Gcm::new_from_slice(aes_key)
+        .map_err(|e| VaultError::DecryptionError(e.to_string()))?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    // AAD is UUID without dashes, hex-decoded to bytes
+    let aad_hex = uuid.replace("-", "");
+    let aad = hex::decode(&aad_hex)
+        .map_err(|e| VaultError::DecryptionError(format!("AAD hex decode: {}", e)))?;
+
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: plaintext.as_bytes(),
+                aad: &aad,
+            },
+        )
+        .map_err(|e| VaultError::DecryptionError(e.to_string()))?;
+
+    // Return hex-encoded ciphertext (includes auth tag)
+    Ok(hex::encode(ciphertext))
 }
 
 fn derive_key(password: &str, salt: &[u8], iterations: u32) -> Vec<u8> {
