@@ -310,14 +310,17 @@ impl ItemField {
             .map_err(|e| VaultError::DecryptionError(e.to_string()))?;
         let nonce = Nonce::from_slice(nonce_bytes);
 
-        let aad = uuid.replace("-", "");
+        // AAD is UUID without dashes, hex-decoded to bytes
+        let aad_hex = uuid.replace("-", "");
+        let aad = hex::decode(&aad_hex)
+            .map_err(|e| VaultError::DecryptionError(format!("AAD hex decode: {}", e)))?;
 
         let plaintext = cipher
             .decrypt(
                 nonce,
                 aes_gcm::aead::Payload {
                     msg: &ciphertext,
-                    aad: aad.as_bytes(),
+                    aad: &aad,
                 },
             )
             .map_err(|e| VaultError::DecryptionError(e.to_string()))?;
