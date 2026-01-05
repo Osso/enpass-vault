@@ -432,6 +432,110 @@ impl Vault {
         Ok(item_uuid)
     }
 
+    /// Add a new field to an existing item
+    pub fn add_field(&self, item_uuid: &str, field_type: &str, value: &str, sensitive: bool) -> Result<()> {
+        // Get the item to get its encryption key
+        let item = self.find_item_by_uuid(item_uuid)?
+            .ok_or_else(|| VaultError::DecryptionError("Item not found".into()))?;
+
+        let key = item.key.as_ref()
+            .ok_or_else(|| VaultError::DecryptionError("Item has no encryption key".into()))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Find next available item_field_uid
+        let max_uid: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(item_field_uid), 9) FROM itemfield WHERE item_uuid = ?",
+            rusqlite::params![item_uuid],
+            |row| row.get(0),
+        )?;
+        let new_uid = max_uid + 1;
+
+        // Find next orde value
+        let max_orde: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(orde), 0) FROM itemfield WHERE item_uuid = ? AND deleted = 0",
+            rusqlite::params![item_uuid],
+            |row| row.get(0),
+        )?;
+        let new_orde = max_orde + 1;
+
+        // Encrypt if sensitive
+        let field_value = if sensitive {
+            encrypt_field(value, key, item_uuid)?
+        } else {
+            value.to_string()
+        };
+
+        // Compute hash (SHA1 of value)
+        let hash = if !value.is_empty() {
+            use sha1::{Sha1, Digest};
+            let mut hasher = Sha1::new();
+            hasher.update(value.as_bytes());
+            hex::encode(hasher.finalize())
+        } else {
+            String::new()
+        };
+
+        // Initial is first 2 chars for sensitive fields
+        let initial = if sensitive && !value.is_empty() {
+            value.chars().take(2).collect::<String>()
+        } else {
+            String::new()
+        };
+
+        // Insert the field
+        self.conn.execute(
+            "INSERT INTO itemfield (item_uuid, item_field_uid, label, value, type, sensitive, deleted, historical, form_id, updated_at, value_updated_at, orde, wearable, history, initial, hash, strength, algo_version, expiry, excluded, pwned_check_time, extra)
+             VALUES (?, ?, '', ?, ?, ?, 0, 1, '', ?, ?, ?, 0, '', ?, ?, -1, 1, 0, 0, 0, '')",
+            rusqlite::params![
+                item_uuid,
+                new_uid,
+                field_value,
+                field_type,
+                if sensitive { 1 } else { 0 },
+                now,
+                now,
+                new_orde,
+                initial,
+                hash,
+            ],
+        )?;
+
+        // Update item timestamps
+        self.conn.execute(
+            "UPDATE item SET field_updated_at = ?, updated_at = ? WHERE uuid = ?",
+            rusqlite::params![now, now, item_uuid],
+        )?;
+
+        Ok(())
+    }
+
+    /// Remove a field from an item (soft-delete)
+    pub fn remove_field(&self, item_uuid: &str, field_type: &str) -> Result<bool> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let rows_affected = self.conn.execute(
+            "UPDATE itemfield SET deleted = 1, updated_at = ? WHERE item_uuid = ? AND type = ? AND deleted = 0",
+            rusqlite::params![now, item_uuid, field_type],
+        )?;
+
+        if rows_affected > 0 {
+            // Update item timestamps
+            self.conn.execute(
+                "UPDATE item SET field_updated_at = ?, updated_at = ? WHERE uuid = ?",
+                rusqlite::params![now, now, item_uuid],
+            )?;
+        }
+
+        Ok(rows_affected > 0)
+    }
+
     /// Soft-delete an item
     pub fn delete_item(&self, item_uuid: &str) -> Result<()> {
         let now = std::time::SystemTime::now()
