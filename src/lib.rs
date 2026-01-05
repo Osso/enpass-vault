@@ -324,8 +324,19 @@ impl Vault {
         let key = item.key.as_ref()
             .ok_or_else(|| VaultError::DecryptionError("Item has no encryption key".into()))?;
 
-        // Encrypt the new value
-        let encrypted = encrypt_field(new_value, key, item_uuid)?;
+        // Check if field is sensitive (needs encryption)
+        let sensitive: i32 = self.conn.query_row(
+            "SELECT sensitive FROM itemfield WHERE item_uuid = ? AND type = ? AND deleted = 0",
+            rusqlite::params![item_uuid, field_type],
+            |row| row.get(0),
+        ).unwrap_or(1); // Default to sensitive if not found
+
+        // Only encrypt if the field is sensitive
+        let value_to_store: Vec<u8> = if sensitive != 0 {
+            encrypt_field(new_value, key, item_uuid)?.into_bytes()
+        } else {
+            new_value.as_bytes().to_vec()
+        };
 
         // Update the field
         let now = std::time::SystemTime::now()
@@ -336,7 +347,7 @@ impl Vault {
         self.conn.execute(
             "UPDATE itemfield SET value = ?, updated_at = ?, value_updated_at = ?
              WHERE item_uuid = ? AND type = ? AND deleted = 0",
-            rusqlite::params![encrypted, now, now, item_uuid, field_type],
+            rusqlite::params![value_to_store, now, now, item_uuid, field_type],
         )?;
 
         // Update item timestamps
