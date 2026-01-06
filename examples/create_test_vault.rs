@@ -32,8 +32,10 @@ fn main() {
 
     // Create encrypted database with our chosen salt and derived key
     let conn = Connection::open(&db_path).expect("Failed to open database");
-    conn.pragma_update(None, "key", format!("x'{}'", hex_key)).expect("Failed to set key");
-    conn.pragma_update(None, "cipher_compatibility", 3).expect("Failed to set compatibility");
+    conn.pragma_update(None, "key", format!("x'{}'", hex_key))
+        .expect("Failed to set key");
+    conn.pragma_update(None, "cipher_compatibility", 3)
+        .expect("Failed to set compatibility");
     conn.pragma_update(None, "cipher_salt", format!("x'{}'", hex::encode(salt)))
         .expect("Failed to set salt");
 
@@ -213,7 +215,7 @@ fn create_test_item(conn: &Connection, title: &str, category: &str, fields: &[(&
 }
 
 fn encrypt_field(plaintext: &str, item_key: &[u8], uuid: &str) -> String {
-    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 
     let aes_key = &item_key[0..32];
     let nonce_bytes = &item_key[32..44];

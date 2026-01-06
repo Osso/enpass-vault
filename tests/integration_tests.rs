@@ -25,7 +25,11 @@ fn test_list_items() {
     let items = vault.list_items(None).unwrap();
 
     // At least 4 items from fixtures (tests may create additional temporary items)
-    assert!(items.len() >= 4, "Should have at least 4 test items, got {}", items.len());
+    assert!(
+        items.len() >= 4,
+        "Should have at least 4 test items, got {}",
+        items.len()
+    );
 
     let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
     assert!(titles.contains(&"Test Login"));
@@ -116,7 +120,10 @@ fn test_decrypt_non_sensitive_field() {
     let key = item.key.as_ref().unwrap();
 
     let username_field = fields.iter().find(|f| f.field_type == "username").unwrap();
-    assert_eq!(username_field.sensitive, 0, "Username should not be sensitive");
+    assert_eq!(
+        username_field.sensitive, 0,
+        "Username should not be sensitive"
+    );
 
     let decrypted = username_field.decrypt(key, &item.uuid).unwrap();
     assert_eq!(decrypted, "testuser");
@@ -128,11 +135,18 @@ fn test_search() {
 
     // Search by title
     let results = vault.search("Login").unwrap();
-    assert_eq!(results.len(), 2, "Should find 2 items with 'Login' in title");
+    assert_eq!(
+        results.len(),
+        2,
+        "Should find 2 items with 'Login' in title"
+    );
 
     // Search by URL field value
     let results = vault.search("example.com").unwrap();
-    assert!(!results.is_empty(), "Should find items with example.com in fields");
+    assert!(
+        !results.is_empty(),
+        "Should find items with example.com in fields"
+    );
 }
 
 #[test]
@@ -189,7 +203,9 @@ fn test_update_field() {
         .unwrap();
 
     // Update the password
-    vault.update_field(&uuid, "password", "updated_password").unwrap();
+    vault
+        .update_field(&uuid, "password", "updated_password")
+        .unwrap();
 
     // Verify the update
     let item = vault.find_item_by_uuid(&uuid).unwrap().unwrap();
@@ -222,7 +238,9 @@ fn test_add_field() {
     assert_eq!(fields.len(), 2, "Should have 2 fields now");
 
     let password_field = fields.iter().find(|f| f.field_type == "password").unwrap();
-    let decrypted = password_field.decrypt(item.key.as_ref().unwrap(), &uuid).unwrap();
+    let decrypted = password_field
+        .decrypt(item.key.as_ref().unwrap(), &uuid)
+        .unwrap();
     assert_eq!(decrypted, "newpass");
 
     // Clean up
@@ -238,10 +256,7 @@ fn test_remove_field() {
         .create_item(
             "Remove Field Test",
             "login",
-            &[
-                ("username", "user", false),
-                ("password", "pass", true),
-            ],
+            &[("username", "user", false), ("password", "pass", true)],
         )
         .unwrap();
 

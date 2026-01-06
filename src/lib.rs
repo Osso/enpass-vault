@@ -1,6 +1,6 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
 };
 use pbkdf2::pbkdf2_hmac;
 use rusqlite::Connection;
@@ -219,9 +219,9 @@ impl Vault {
     }
 
     pub fn get_categories(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT category FROM item WHERE trashed = 0 ORDER BY category",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT category FROM item WHERE trashed = 0 ORDER BY category")?;
 
         let categories: Vec<String> = stmt
             .query([])?
@@ -279,9 +279,9 @@ impl Vault {
 
     /// Dump raw itemfield data for debugging
     pub fn dump_raw_fields(&self, item_uuid: &str) -> Result<Vec<Vec<(String, String)>>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM itemfield WHERE item_uuid = ?",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM itemfield WHERE item_uuid = ?")?;
 
         let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let mut rows = stmt.query([item_uuid])?;
@@ -302,7 +302,7 @@ impl Vault {
                         } else {
                             format!("\"{}\"", s)
                         }
-                    },
+                    }
                     ValueRef::Blob(b) => format!("<blob {} bytes>", b.len()),
                 };
                 field_data.push((name.clone(), value));
@@ -318,18 +318,24 @@ impl Vault {
     /// Update a field's value for an existing item
     pub fn update_field(&self, item_uuid: &str, field_type: &str, new_value: &str) -> Result<()> {
         // Get the item to get its encryption key
-        let item = self.find_item_by_uuid(item_uuid)?
+        let item = self
+            .find_item_by_uuid(item_uuid)?
             .ok_or_else(|| VaultError::DecryptionError("Item not found".into()))?;
 
-        let key = item.key.as_ref()
+        let key = item
+            .key
+            .as_ref()
             .ok_or_else(|| VaultError::DecryptionError("Item has no encryption key".into()))?;
 
         // Check if field is sensitive (needs encryption)
-        let sensitive: i32 = self.conn.query_row(
-            "SELECT sensitive FROM itemfield WHERE item_uuid = ? AND type = ? AND deleted = 0",
-            rusqlite::params![item_uuid, field_type],
-            |row| row.get(0),
-        ).unwrap_or(1); // Default to sensitive if not found
+        let sensitive: i32 = self
+            .conn
+            .query_row(
+                "SELECT sensitive FROM itemfield WHERE item_uuid = ? AND type = ? AND deleted = 0",
+                rusqlite::params![item_uuid, field_type],
+                |row| row.get(0),
+            )
+            .unwrap_or(1); // Default to sensitive if not found
 
         // Only encrypt if the field is sensitive
         let value_to_store: Vec<u8> = if sensitive != 0 {
@@ -360,7 +366,12 @@ impl Vault {
     }
 
     /// Create a new item with fields
-    pub fn create_item(&self, title: &str, category: &str, fields: &[(&str, &str, bool)]) -> Result<String> {
+    pub fn create_item(
+        &self,
+        title: &str,
+        category: &str,
+        fields: &[(&str, &str, bool)],
+    ) -> Result<String> {
         use rand::RngCore;
 
         let item_uuid = uuid::Uuid::new_v4().to_string();
@@ -396,7 +407,7 @@ impl Vault {
 
             // Compute hash like Enpass does (SHA1 of value)
             let hash = if !value.is_empty() {
-                use sha1::{Sha1, Digest};
+                use sha1::{Digest, Sha1};
                 let mut hasher = Sha1::new();
                 hasher.update(value.as_bytes());
                 hex::encode(hasher.finalize())
@@ -433,12 +444,21 @@ impl Vault {
     }
 
     /// Add a new field to an existing item
-    pub fn add_field(&self, item_uuid: &str, field_type: &str, value: &str, sensitive: bool) -> Result<()> {
+    pub fn add_field(
+        &self,
+        item_uuid: &str,
+        field_type: &str,
+        value: &str,
+        sensitive: bool,
+    ) -> Result<()> {
         // Get the item to get its encryption key
-        let item = self.find_item_by_uuid(item_uuid)?
+        let item = self
+            .find_item_by_uuid(item_uuid)?
             .ok_or_else(|| VaultError::DecryptionError("Item not found".into()))?;
 
-        let key = item.key.as_ref()
+        let key = item
+            .key
+            .as_ref()
             .ok_or_else(|| VaultError::DecryptionError("Item has no encryption key".into()))?;
 
         let now = std::time::SystemTime::now()
@@ -471,7 +491,7 @@ impl Vault {
 
         // Compute hash (SHA1 of value)
         let hash = if !value.is_empty() {
-            use sha1::{Sha1, Digest};
+            use sha1::{Digest, Sha1};
             let mut hasher = Sha1::new();
             hasher.update(value.as_bytes());
             hex::encode(hasher.finalize())

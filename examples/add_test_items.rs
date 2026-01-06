@@ -14,7 +14,11 @@ fn main() {
         let fields = [
             ("username", &format!("user{}", i) as &str, false),
             ("password", &format!("pass{}", i) as &str, true),
-            ("url", &format!("https://test{}.example.com", i) as &str, false),
+            (
+                "url",
+                &format!("https://test{}.example.com", i) as &str,
+                false,
+            ),
         ];
 
         match vault.create_item(&title, "login", &fields) {
