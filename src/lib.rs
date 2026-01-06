@@ -724,4 +724,82 @@ mod tests {
         let key = derive_key("test", b"0123456789abcdef", 1000);
         assert_eq!(key.len(), 64);
     }
+
+    #[test]
+    fn test_encryption_roundtrip() {
+        // Create a 44-byte key (32 AES + 12 nonce)
+        let key = vec![0x42u8; 44];
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let plaintext = "secret password";
+
+        let encrypted = encrypt_field(plaintext, &key, uuid).unwrap();
+        assert_ne!(encrypted, plaintext);
+
+        // Create a field to decrypt
+        let field = ItemField {
+            label: String::new(),
+            value: Some(encrypted.into_bytes()),
+            field_type: "password".to_string(),
+            sensitive: 1,
+        };
+
+        let decrypted = field.decrypt(&key, uuid).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_encryption_with_different_uuids() {
+        let key = vec![0x42u8; 44];
+        let uuid1 = "550e8400-e29b-41d4-a716-446655440000";
+        let uuid2 = "660e8400-e29b-41d4-a716-446655440000";
+        let plaintext = "secret";
+
+        let encrypted1 = encrypt_field(plaintext, &key, uuid1).unwrap();
+        let encrypted2 = encrypt_field(plaintext, &key, uuid2).unwrap();
+
+        // Same plaintext with different UUIDs should produce different ciphertext
+        // (UUID is used as AAD)
+        assert_ne!(encrypted1, encrypted2);
+    }
+
+    #[test]
+    fn test_decrypt_non_sensitive_field() {
+        let key = vec![0x42u8; 44];
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+
+        let field = ItemField {
+            label: String::new(),
+            value: Some(b"plain text value".to_vec()),
+            field_type: "url".to_string(),
+            sensitive: 0,
+        };
+
+        let decrypted = field.decrypt(&key, uuid).unwrap();
+        assert_eq!(decrypted, "plain text value");
+    }
+
+    #[test]
+    fn test_decrypt_empty_field() {
+        let key = vec![0x42u8; 44];
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+
+        let field = ItemField {
+            label: String::new(),
+            value: None,
+            field_type: "note".to_string(),
+            sensitive: 1,
+        };
+
+        let decrypted = field.decrypt(&key, uuid).unwrap();
+        assert_eq!(decrypted, "");
+    }
+
+    #[test]
+    fn test_encrypt_field_invalid_key_length() {
+        let short_key = vec![0x42u8; 20]; // Too short
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+
+        let result = encrypt_field("test", &short_key, uuid);
+        assert!(result.is_err());
+    }
 }
