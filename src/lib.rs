@@ -277,6 +277,24 @@ impl Vault {
         Ok(result)
     }
 
+    fn format_column_value(val: rusqlite::types::ValueRef) -> String {
+        use rusqlite::types::ValueRef;
+        match val {
+            ValueRef::Null => "NULL".to_string(),
+            ValueRef::Integer(n) => n.to_string(),
+            ValueRef::Real(f) => f.to_string(),
+            ValueRef::Text(t) => {
+                let s = String::from_utf8_lossy(t);
+                if s.len() > 50 {
+                    format!("\"{}...\"", &s[..50])
+                } else {
+                    format!("\"{}\"", s)
+                }
+            }
+            ValueRef::Blob(b) => format!("<blob {} bytes>", b.len()),
+        }
+    }
+
     /// Dump raw itemfield data for debugging
     pub fn dump_raw_fields(&self, item_uuid: &str) -> Result<Vec<Vec<(String, String)>>> {
         let mut stmt = self
@@ -290,21 +308,7 @@ impl Vault {
         while let Some(row) = rows.next()? {
             let mut field_data = Vec::new();
             for (i, name) in column_names.iter().enumerate() {
-                use rusqlite::types::ValueRef;
-                let value = match row.get_ref(i)? {
-                    ValueRef::Null => "NULL".to_string(),
-                    ValueRef::Integer(n) => n.to_string(),
-                    ValueRef::Real(f) => f.to_string(),
-                    ValueRef::Text(t) => {
-                        let s = String::from_utf8_lossy(t);
-                        if s.len() > 50 {
-                            format!("\"{}...\"", &s[..50])
-                        } else {
-                            format!("\"{}\"", s)
-                        }
-                    }
-                    ValueRef::Blob(b) => format!("<blob {} bytes>", b.len()),
-                };
+                let value = Self::format_column_value(row.get_ref(i)?);
                 field_data.push((name.clone(), value));
             }
             result.push(field_data);
