@@ -10,6 +10,8 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
+mod format;
+
 #[derive(Error, Debug)]
 pub enum VaultError {
     #[error("Failed to read file: {0}")]
@@ -32,6 +34,15 @@ pub enum VaultError {
 
     #[error("Wrong password")]
     WrongPassword,
+
+    #[error("Item field not found: item {item_uuid}, field {field_type}")]
+    ItemFieldNotFound {
+        item_uuid: String,
+        field_type: String,
+    },
+
+    #[error("Unsupported vault format: {0}")]
+    UnsupportedVaultFormat(String),
 }
 
 pub type Result<T> = std::result::Result<T, VaultError>;
@@ -311,29 +322,33 @@ impl Vault {
     // Write operations
 
     pub fn update_field(&self, item_uuid: &str, field_type: &str, new_value: &str) -> Result<()> {
+        format::ensure_supported_write_schema(&self.conn)?;
         let key = self.item_key(item_uuid)?;
 
-        let sensitive: i32 = self
-            .conn
-            .query_row(
-                "SELECT sensitive FROM itemfield WHERE item_uuid = ? AND type = ? AND deleted = 0",
-                rusqlite::params![item_uuid, field_type],
-                |row| row.get(0),
-            )
-            .unwrap_or(1);
+        let sensitive = self.find_field_sensitivity(item_uuid, field_type)?;
 
         let value_to_store: Vec<u8> = if sensitive != 0 {
             encrypt_field(new_value, &key, item_uuid)?.into_bytes()
         } else {
             new_value.as_bytes().to_vec()
         };
-
+        let hash = compute_field_hash(new_value);
+        let initial = compute_field_initial(new_value, sensitive != 0);
         let now = unix_now();
 
         self.conn.execute(
-            "UPDATE itemfield SET value = ?, updated_at = ?, value_updated_at = ?
+            "UPDATE itemfield
+             SET value = ?, hash = ?, initial = ?, updated_at = ?, value_updated_at = ?
              WHERE item_uuid = ? AND type = ? AND deleted = 0",
-            rusqlite::params![value_to_store, now, now, item_uuid, field_type],
+            rusqlite::params![
+                value_to_store,
+                hash,
+                initial,
+                now,
+                now,
+                item_uuid,
+                field_type
+            ],
         )?;
 
         self.touch_item(item_uuid, now)?;
@@ -349,6 +364,7 @@ impl Vault {
     ) -> Result<String> {
         use rand::RngCore;
 
+        format::ensure_supported_write_schema(&self.conn)?;
         let item_uuid = uuid::Uuid::new_v4().to_string();
         let now = unix_now();
 
@@ -388,6 +404,7 @@ impl Vault {
         value: &str,
         sensitive: bool,
     ) -> Result<()> {
+        format::ensure_supported_write_schema(&self.conn)?;
         let key = self.item_key(item_uuid)?;
         let now = unix_now();
 
@@ -415,6 +432,7 @@ impl Vault {
     }
 
     pub fn remove_field(&self, item_uuid: &str, field_type: &str) -> Result<bool> {
+        format::ensure_supported_write_schema(&self.conn)?;
         let now = unix_now();
 
         let rows_affected = self.conn.execute(
@@ -430,6 +448,7 @@ impl Vault {
     }
 
     pub fn delete_item(&self, item_uuid: &str) -> Result<()> {
+        format::ensure_supported_write_schema(&self.conn)?;
         let now = unix_now();
 
         self.conn.execute(
@@ -478,6 +497,23 @@ impl Vault {
             .ok_or_else(|| VaultError::DecryptionError("Item not found".into()))?;
         item.key
             .ok_or_else(|| VaultError::DecryptionError("Item has no encryption key".into()))
+    }
+
+    fn find_field_sensitivity(&self, item_uuid: &str, field_type: &str) -> Result<i32> {
+        let result = self.conn.query_row(
+            "SELECT sensitive FROM itemfield WHERE item_uuid = ? AND type = ? AND deleted = 0",
+            rusqlite::params![item_uuid, field_type],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(sensitive) => Ok(sensitive),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(VaultError::ItemFieldNotFound {
+                item_uuid: item_uuid.to_string(),
+                field_type: field_type.to_string(),
+            }),
+            Err(error) => Err(VaultError::SqlError(error)),
+        }
     }
 
     fn touch_item(&self, item_uuid: &str, now: i64) -> Result<()> {
@@ -583,61 +619,17 @@ pub struct ItemField {
 
 impl ItemField {
     pub fn decrypt(&self, item_key: &[u8], uuid: &str) -> Result<String> {
-        let value = match &self.value {
-            Some(v) if !v.is_empty() => v,
-            _ => return Ok(String::new()),
+        let Some(value) = self.non_empty_value() else {
+            return Ok(String::new());
         };
 
         if self.sensitive == 0 {
             return Ok(String::from_utf8_lossy(value).to_string());
         }
 
-        if item_key.len() < 44 {
-            return Err(VaultError::DecryptionError(format!(
-                "Invalid item key length: {}",
-                item_key.len()
-            )));
-        }
-
-        // Value might be hex-encoded (stored as text), decode if needed
-        let ciphertext = if value.iter().all(|b| b.is_ascii_hexdigit()) {
-            // It's hex-encoded, decode it
-            let hex_str = String::from_utf8_lossy(value);
-            hex::decode(hex_str.as_ref())
-                .map_err(|e| VaultError::DecryptionError(format!("Hex decode error: {}", e)))?
-        } else {
-            value.clone()
-        };
-
-        if ciphertext.len() < 16 {
-            return Err(VaultError::DecryptionError(
-                "Encrypted value too short".into(),
-            ));
-        }
-
-        let aes_key = &item_key[0..32];
-        let nonce_bytes = &item_key[32..44];
-
-        let cipher = Aes256Gcm::new_from_slice(aes_key)
-            .map_err(|e| VaultError::DecryptionError(e.to_string()))?;
-        let nonce = Nonce::from_slice(nonce_bytes);
-
-        // AAD is UUID without dashes, hex-decoded to bytes
-        let aad_hex = uuid.replace("-", "");
-        let aad = hex::decode(&aad_hex)
-            .map_err(|e| VaultError::DecryptionError(format!("AAD hex decode: {}", e)))?;
-
-        let plaintext = cipher
-            .decrypt(
-                nonce,
-                aes_gcm::aead::Payload {
-                    msg: &ciphertext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|e| VaultError::DecryptionError(e.to_string()))?;
-
-        Ok(String::from_utf8_lossy(&plaintext).to_string())
+        validate_item_key_len(item_key)?;
+        let ciphertext = decode_ciphertext(value)?;
+        decrypt_ciphertext(&ciphertext, item_key, uuid)
     }
 
     pub fn display_label(&self) -> &str {
@@ -647,17 +639,16 @@ impl ItemField {
             &self.label
         }
     }
+
+    fn non_empty_value(&self) -> Option<&[u8]> {
+        self.value.as_deref().filter(|value| !value.is_empty())
+    }
 }
 
 fn encrypt_field(plaintext: &str, item_key: &[u8], uuid: &str) -> Result<String> {
     use aes_gcm::aead::Aead;
 
-    if item_key.len() < 44 {
-        return Err(VaultError::DecryptionError(format!(
-            "Invalid item key length: {}",
-            item_key.len()
-        )));
-    }
+    validate_item_key_len(item_key)?;
 
     let aes_key = &item_key[0..32];
     let nonce_bytes = &item_key[32..44];
@@ -666,10 +657,7 @@ fn encrypt_field(plaintext: &str, item_key: &[u8], uuid: &str) -> Result<String>
         .map_err(|e| VaultError::DecryptionError(e.to_string()))?;
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    // AAD is UUID without dashes, hex-decoded to bytes
-    let aad_hex = uuid.replace("-", "");
-    let aad = hex::decode(&aad_hex)
-        .map_err(|e| VaultError::DecryptionError(format!("AAD hex decode: {}", e)))?;
+    let aad = decode_aad(uuid)?;
 
     let ciphertext = cipher
         .encrypt(
@@ -684,6 +672,61 @@ fn encrypt_field(plaintext: &str, item_key: &[u8], uuid: &str) -> Result<String>
     Ok(hex::encode(ciphertext))
 }
 
+fn validate_item_key_len(item_key: &[u8]) -> Result<()> {
+    if item_key.len() >= 44 {
+        return Ok(());
+    }
+
+    Err(VaultError::DecryptionError(format!(
+        "Invalid item key length: {}",
+        item_key.len()
+    )))
+}
+
+fn decode_ciphertext(value: &[u8]) -> Result<Vec<u8>> {
+    let ciphertext = if value.iter().all(|b| b.is_ascii_hexdigit()) {
+        let hex_str = String::from_utf8_lossy(value);
+        hex::decode(hex_str.as_ref())
+            .map_err(|e| VaultError::DecryptionError(format!("Hex decode error: {}", e)))?
+    } else {
+        value.to_vec()
+    };
+
+    if ciphertext.len() < 16 {
+        return Err(VaultError::DecryptionError(
+            "Encrypted value too short".into(),
+        ));
+    }
+
+    Ok(ciphertext)
+}
+
+fn decrypt_ciphertext(ciphertext: &[u8], item_key: &[u8], uuid: &str) -> Result<String> {
+    let aes_key = &item_key[0..32];
+    let nonce_bytes = &item_key[32..44];
+    let cipher = Aes256Gcm::new_from_slice(aes_key)
+        .map_err(|e| VaultError::DecryptionError(e.to_string()))?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let aad = decode_aad(uuid)?;
+
+    let plaintext = cipher
+        .decrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|e| VaultError::DecryptionError(e.to_string()))?;
+
+    Ok(String::from_utf8_lossy(&plaintext).to_string())
+}
+
+fn decode_aad(uuid: &str) -> Result<Vec<u8>> {
+    let aad_hex = uuid.replace("-", "");
+    hex::decode(&aad_hex).map_err(|e| VaultError::DecryptionError(format!("AAD hex decode: {}", e)))
+}
+
 fn derive_key(password: &str, salt: &[u8], iterations: u32) -> Vec<u8> {
     let mut key = vec![0u8; 64];
     pbkdf2_hmac::<Sha512>(password.as_bytes(), salt, iterations, &mut key);
@@ -691,107 +734,4 @@ fn derive_key(password: &str, salt: &[u8], iterations: u32) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_key_derivation() {
-        let key = derive_key("test", b"0123456789abcdef", 1000);
-        assert_eq!(key.len(), 64);
-    }
-
-    #[test]
-    fn test_encryption_roundtrip() {
-        // Create a 44-byte key (32 AES + 12 nonce)
-        let key = vec![0x42u8; 44];
-        let uuid = "550e8400-e29b-41d4-a716-446655440000";
-        let plaintext = "secret password";
-
-        let encrypted = encrypt_field(plaintext, &key, uuid).unwrap();
-        assert_ne!(encrypted, plaintext);
-
-        // Create a field to decrypt
-        let field = ItemField {
-            label: String::new(),
-            value: Some(encrypted.into_bytes()),
-            field_type: "password".to_string(),
-            sensitive: 1,
-        };
-
-        let decrypted = field.decrypt(&key, uuid).unwrap();
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn test_encryption_with_different_uuids() {
-        let key = vec![0x42u8; 44];
-        let uuid1 = "550e8400-e29b-41d4-a716-446655440000";
-        let uuid2 = "660e8400-e29b-41d4-a716-446655440000";
-        let plaintext = "secret";
-
-        let encrypted1 = encrypt_field(plaintext, &key, uuid1).unwrap();
-        let encrypted2 = encrypt_field(plaintext, &key, uuid2).unwrap();
-
-        // Same plaintext with different UUIDs should produce different ciphertext
-        // (UUID is used as AAD)
-        assert_ne!(encrypted1, encrypted2);
-    }
-
-    #[test]
-    fn test_decrypt_non_sensitive_field() {
-        let key = vec![0x42u8; 44];
-        let uuid = "550e8400-e29b-41d4-a716-446655440000";
-
-        let field = ItemField {
-            label: String::new(),
-            value: Some(b"plain text value".to_vec()),
-            field_type: "url".to_string(),
-            sensitive: 0,
-        };
-
-        let decrypted = field.decrypt(&key, uuid).unwrap();
-        assert_eq!(decrypted, "plain text value");
-    }
-
-    #[test]
-    fn test_decrypt_empty_field() {
-        let key = vec![0x42u8; 44];
-        let uuid = "550e8400-e29b-41d4-a716-446655440000";
-
-        let field = ItemField {
-            label: String::new(),
-            value: None,
-            field_type: "note".to_string(),
-            sensitive: 1,
-        };
-
-        let decrypted = field.decrypt(&key, uuid).unwrap();
-        assert_eq!(decrypted, "");
-    }
-
-    #[test]
-    fn test_encrypt_field_invalid_key_length() {
-        let short_key = vec![0x42u8; 20]; // Too short
-        let uuid = "550e8400-e29b-41d4-a716-446655440000";
-
-        let result = encrypt_field("test", &short_key, uuid);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_compute_field_hash() {
-        assert_eq!(compute_field_hash(""), "");
-        let h = compute_field_hash("hello");
-        assert!(!h.is_empty());
-        assert_eq!(h, compute_field_hash("hello"));
-        assert_ne!(h, compute_field_hash("world"));
-    }
-
-    #[test]
-    fn test_compute_field_initial() {
-        assert_eq!(compute_field_initial("hello", true), "he");
-        assert_eq!(compute_field_initial("hello", false), "");
-        assert_eq!(compute_field_initial("", true), "");
-        assert_eq!(compute_field_initial("x", true), "x");
-    }
-}
+mod tests;

@@ -1,4 +1,5 @@
 use enpass_vault::{Vault, VaultError};
+use std::fs;
 use std::path::PathBuf;
 
 fn test_vault_path() -> PathBuf {
@@ -6,6 +7,39 @@ fn test_vault_path() -> PathBuf {
 }
 
 const TEST_PASSWORD: &str = "test123";
+
+struct TestVaultCopy {
+    path: PathBuf,
+}
+
+impl TestVaultCopy {
+    fn create() -> Self {
+        let path = std::env::temp_dir().join(format!("enpass-vault-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        fs::copy(
+            test_vault_path().join("vault.json"),
+            path.join("vault.json"),
+        )
+        .unwrap();
+        fs::copy(
+            test_vault_path().join("vault.enpassdb"),
+            path.join("vault.enpassdb"),
+        )
+        .unwrap();
+
+        Self { path }
+    }
+
+    fn path(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl Drop for TestVaultCopy {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
 
 #[test]
 fn test_open_vault_correct_password() {
@@ -162,7 +196,8 @@ fn test_get_categories() {
 
 #[test]
 fn test_create_and_delete_item() {
-    let vault = Vault::open(test_vault_path(), TEST_PASSWORD).unwrap();
+    let test_vault = TestVaultCopy::create();
+    let vault = Vault::open(test_vault.path(), TEST_PASSWORD).unwrap();
 
     // Create new item
     let uuid = vault
@@ -191,7 +226,8 @@ fn test_create_and_delete_item() {
 
 #[test]
 fn test_update_field() {
-    let vault = Vault::open(test_vault_path(), TEST_PASSWORD).unwrap();
+    let test_vault = TestVaultCopy::create();
+    let vault = Vault::open(test_vault.path(), TEST_PASSWORD).unwrap();
 
     // Create a test item
     let uuid = vault
@@ -222,7 +258,8 @@ fn test_update_field() {
 
 #[test]
 fn test_add_field() {
-    let vault = Vault::open(test_vault_path(), TEST_PASSWORD).unwrap();
+    let test_vault = TestVaultCopy::create();
+    let vault = Vault::open(test_vault.path(), TEST_PASSWORD).unwrap();
 
     // Create a test item with one field
     let uuid = vault
@@ -249,7 +286,8 @@ fn test_add_field() {
 
 #[test]
 fn test_remove_field() {
-    let vault = Vault::open(test_vault_path(), TEST_PASSWORD).unwrap();
+    let test_vault = TestVaultCopy::create();
+    let vault = Vault::open(test_vault.path(), TEST_PASSWORD).unwrap();
 
     // Create a test item with two fields
     let uuid = vault
