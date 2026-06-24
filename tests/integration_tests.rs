@@ -54,6 +54,39 @@ fn test_open_vault_wrong_password() {
 }
 
 #[test]
+fn test_open_vault_rejects_keyfile() {
+    let path = std::env::temp_dir().join(format!("enpass-vault-keyfile-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&path).unwrap();
+    fs::write(
+        path.join("vault.json"),
+        r#"{"kdf_iter":1000,"have_keyfile":1}"#,
+    )
+    .unwrap();
+
+    let result = Vault::open(&path, TEST_PASSWORD);
+
+    fs::remove_dir_all(&path).unwrap();
+    assert!(matches!(result, Err(VaultError::KeyfileNotSupported)));
+}
+
+#[test]
+fn test_open_vault_rejects_short_database() {
+    let path = std::env::temp_dir().join(format!("enpass-vault-short-db-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&path).unwrap();
+    fs::write(
+        path.join("vault.json"),
+        r#"{"kdf_iter":1000,"have_keyfile":0}"#,
+    )
+    .unwrap();
+    fs::write(path.join("vault.enpassdb"), b"short").unwrap();
+
+    let result = Vault::open(&path, TEST_PASSWORD);
+
+    fs::remove_dir_all(&path).unwrap();
+    assert!(matches!(result, Err(VaultError::InvalidVault)));
+}
+
+#[test]
 fn test_list_items() {
     let vault = Vault::open(test_vault_path(), TEST_PASSWORD).unwrap();
     let items = vault.list_items(None).unwrap();
@@ -192,6 +225,27 @@ fn test_get_categories() {
     assert!(categories.contains(&"login".to_string()));
     assert!(categories.contains(&"creditcard".to_string()));
     assert!(categories.contains(&"note".to_string()));
+}
+
+#[test]
+fn test_dump_helpers_expose_fixture_rows() {
+    let vault = Vault::open(test_vault_path(), TEST_PASSWORD).unwrap();
+    let test_login = vault.find_item("Test Login").unwrap().unwrap();
+
+    let schema = vault.dump_schema().unwrap();
+    let item = vault.dump_raw_item("Test Login").unwrap();
+    let fields = vault.dump_raw_fields(&test_login.uuid).unwrap();
+
+    assert!(schema.iter().any(|(name, _)| name == "item"));
+    assert!(
+        item.iter()
+            .any(|(name, value)| name == "title" && value == "\"Test Login\"")
+    );
+    assert!(fields.iter().any(|field| {
+        field
+            .iter()
+            .any(|(name, value)| name == "type" && value == "\"username\"")
+    }));
 }
 
 #[test]
